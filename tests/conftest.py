@@ -36,6 +36,18 @@ def pytest_addoption(parser):
         default=False,
         help="Run browser in headless mode"
     )
+    parser.addoption(
+        "--selenium-host",
+        action="store",
+        default="localhost",
+        help="Selenium Grid host"
+    )
+    parser.addoption(
+        "--selenium-port",
+        action="store",
+        default="4444",
+        help="Selenium Grid port"
+    )
 
 
 @pytest.fixture(scope="session")
@@ -54,36 +66,77 @@ def headless(request):
     return is_headless
 
 
+@pytest.fixture(scope="session")
+def selenium_host(request):
+    """Get the Selenium Grid host."""
+    host = request.config.getoption("--selenium-host")
+    logger.info(f"Selenium host: {host}")
+    return host
+
+
+@pytest.fixture(scope="session")
+def selenium_port(request):
+    """Get the Selenium Grid port."""
+    port = request.config.getoption("--selenium-port")
+    logger.info(f"Selenium port: {port}")
+    return port
+
+
 @pytest.fixture
-def driver(browser_name, headless):
+def driver(browser_name, headless, selenium_host, selenium_port):
     """
-    Set up WebDriver instance based on browser selection.
+    Set up WebDriver instance for Selenium Grid.
     
     Usage:
         pytest --browser=chrome
-        pytest --browser=firefox
-        pytest --browser=chrome --headless
+        pytest --selenium-host=localhost --selenium-port=4444
     """
-    logger.info(f"Setting up {browser_name} WebDriver")
+    logger.info(f"Setting up RemoteWebDriver for {browser_name}")
     logger.info(f"System info: {platform.platform()}, Python: {platform.python_version()}")
-    logger.info(f"Current working directory: {os.getcwd()}")
-    logger.info(f"Temp directory: {tempfile.gettempdir()}")
     
     try:
-        options = ChromeOptions()
-        unique_profile = f"/tmp/chrome-profile-{uuid.uuid4()}"
-        options.add_argument(f"--user-data-dir={unique_profile}")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-
+        # Create RemoteWebDriver options
+        if browser_name.lower() == "chrome":
+            options = ChromeOptions()
+            logger.info("Initializing Chrome options")
+            
+            if headless:
+                logger.info("Adding --headless argument")
+                options.add_argument("--headless")
+            
+            logger.info("Adding --no-sandbox argument")
+            options.add_argument("--no-sandbox")
+            
+            logger.info("Adding --disable-dev-shm-usage argument")
+            options.add_argument("--disable-dev-shm-usage")
+            
+        elif browser_name.lower() == "firefox":
+            options = FirefoxOptions()
+            logger.info("Initializing Firefox options")
+            
+            if headless:
+                logger.info("Adding --headless argument to Firefox")
+                options.add_argument("--headless")
+        else:
+            error_msg = f"Unsupported browser: {browser_name}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # Set up RemoteWebDriver
+        selenium_url = f"http://{selenium_host}:{selenium_port}/wd/hub"
+        logger.info(f"Connecting to Selenium Grid at: {selenium_url}")
+        
         driver = webdriver.Remote(
-            command_executor="http://localhost:4444/wd/hub",
+            command_executor=selenium_url,
             options=options
         )
         
+        logger.info("RemoteWebDriver session created successfully")
+        logger.info(f"Session ID: {driver.session_id}")
+        
+        # Wait for browser to be ready
         logger.info("Maximizing browser window")
         driver.maximize_window()
-        logger.info("WebDriver session created successfully")
         
         yield driver
         
@@ -94,30 +147,6 @@ def driver(browser_name, headless):
     except Exception as e:
         logger.error(f"Error creating WebDriver: {str(e)}")
         logger.error(f"Exception type: {type(e).__name__}")
-        if isinstance(e, SessionNotCreatedException):
-            logger.error("=" * 80)
-            logger.error("SessionNotCreatedException DETECTED")
-            logger.error("=" * 80)
-            logger.error(f"Exception message: {str(e)}")
-            
-            # Log system information
-            logger.error("System Information:")
-            logger.error(f"  OS: {platform.system()} {platform.release()}")
-            logger.error(f"  Python: {platform.python_version()}")
-            logger.error(f"  Temp directory: {tempfile.gettempdir()}")
-            
-            # Log environment variables that might be relevant
-            logger.error("Environment Variables:")
-            for var in ['HOME', 'TEMP', 'TMP', 'USER', 'PATH']:
-                if var in os.environ:
-                    logger.error(f"  {var}: {os.environ.get(var)}")
-            
-            # Log Chrome-specific environment variables
-            chrome_vars = [v for v in os.environ if 'CHROME' in v]
-            for var in chrome_vars:
-                logger.error(f"  {var}: {os.environ.get(var)}")
-            
-            logger.error("=" * 80)
         raise
 
 @pytest.hookimpl(tryfirst=True)
