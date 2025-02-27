@@ -5,13 +5,17 @@ import os
 import platform
 import sys
 import tempfile
+import socket
+import json
+import requests
+import subprocess
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from webdriver_manager.firefox import GeckoDriverManager
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
-from selenium.common.exceptions import SessionNotCreatedException
+from selenium.common.exceptions import SessionNotCreatedException, WebDriverException
 
 # Configure logging
 logging.basicConfig(
@@ -21,6 +25,44 @@ logging.basicConfig(
     stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
+
+def check_selenium_server(host, port):
+    """Check if Selenium server is running and return status info."""
+    try:
+        url = f"http://{host}:{port}/wd/hub/status"
+        logger.info(f"Checking Selenium server at {url}")
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            logger.info(f"Selenium server status: {json.dumps(data, indent=2)}")
+            return True, data
+        else:
+            logger.error(f"Selenium server returned status code: {response.status_code}")
+            return False, None
+    except requests.exceptions.ConnectionError:
+        logger.error(f"Cannot connect to Selenium server at {host}:{port}")
+        return False, None
+    except Exception as e:
+        logger.error(f"Error checking Selenium server: {str(e)}")
+        return False, None
+
+def check_container_processes():
+    """Run ps command to check for Selenium/Chrome processes."""
+    try:
+        logger.info("Checking all processes in container:")
+        result = subprocess.run(["ps", "-ef"], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if "chrome" in line.lower() or "selenium" in line.lower() or "java" in line.lower():
+                logger.info(f"  {line.strip()}")
+        
+        logger.info("Checking for listening ports:")
+        result = subprocess.run(["netstat", "-tuln"], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if "LISTEN" in line:
+                logger.info(f"  {line.strip()}")
+    except Exception as e:
+        logger.error(f"Error checking container processes: {str(e)}")
 
 def pytest_addoption(parser):
     """Add command-line options for browser selection."""
@@ -47,6 +89,12 @@ def pytest_addoption(parser):
         action="store",
         default="4444",
         help="Selenium Grid port"
+    )
+    parser.addoption(
+        "--remote",
+        action="store_true",
+        default=False,
+        help="Use RemoteWebDriver instead of local WebDriver"
     )
 
 
@@ -82,27 +130,47 @@ def selenium_port(request):
     return port
 
 
+@pytest.fixture(scope="session")
+def use_remote(request):
+    """Whether to use RemoteWebDriver."""
+    remote = request.config.getoption("--remote")
+    logger.info(f"Using RemoteWebDriver: {remote}")
+    return remote
+
+
 @pytest.fixture
-def driver(browser_name, headless, selenium_host, selenium_port):
+def driver(browser_name, headless, selenium_host, selenium_port, use_remote):
     """
-    Set up WebDriver instance for Selenium Grid.
+    Set up WebDriver instance based on browser selection.
     
     Usage:
-        pytest --browser=chrome
-        pytest --selenium-host=localhost --selenium-port=4444
+        pytest --browser=chrome --remote --selenium-host=localhost --selenium-port=4444
+        pytest --browser=chrome  # for local WebDriver
     """
-    logger.info(f"Setting up RemoteWebDriver for {browser_name}")
+    logger.info(f"Setting up {'Remote' if use_remote else 'Local'} WebDriver for {browser_name}")
     logger.info(f"System info: {platform.platform()}, Python: {platform.python_version()}")
+    logger.info(f"Current working directory: {os.getcwd()}")
+    
+    # Check if running in Selenium container
+    in_selenium_container = os.path.exists('/opt/selenium') or os.environ.get('HOME') == '/home/seluser'
+    logger.info(f"Running in Selenium container: {in_selenium_container}")
+    
+    # Always check container environment
+    check_container_processes()
+    
+    # If remote is specified or we're in a Selenium container, check Selenium server
+    if use_remote or in_selenium_container:
+        server_running, server_info = check_selenium_server(selenium_host, selenium_port)
+        logger.info(f"Selenium server running: {server_running}")
     
     try:
-        # Create RemoteWebDriver options
         if browser_name.lower() == "chrome":
             options = ChromeOptions()
             logger.info("Initializing Chrome options")
             
             if headless:
                 logger.info("Adding --headless argument")
-                options.add_argument("--headless")
+                options.add_argument("--headless=new")
             
             logger.info("Adding --no-sandbox argument")
             options.add_argument("--no-sandbox")
@@ -110,6 +178,33 @@ def driver(browser_name, headless, selenium_host, selenium_port):
             logger.info("Adding --disable-dev-shm-usage argument")
             options.add_argument("--disable-dev-shm-usage")
             
+            # Log Chrome options
+            logger.info(f"Chrome options: {options.arguments}")
+            
+            # Use RemoteWebDriver if specified or if we're in a Selenium container
+            if use_remote or in_selenium_container:
+                # Set up RemoteWebDriver
+                selenium_url = f"http://{selenium_host}:{selenium_port}/wd/hub"
+                logger.info(f"Connecting to Selenium Grid at: {selenium_url}")
+                
+                driver = webdriver.Remote(
+                    command_executor=selenium_url,
+                    options=options
+                )
+                logger.info(f"RemoteWebDriver session created with ID: {driver.session_id}")
+            else:
+                # Use local ChromeDriver
+                from selenium.webdriver.chrome.service import Service
+                from webdriver_manager.chrome import ChromeDriverManager
+                
+                logger.info("Installing ChromeDriver")
+                chrome_driver_path = ChromeDriverManager().install()
+                logger.info(f"ChromeDriver installed at: {chrome_driver_path}")
+                
+                logger.info("Creating Chrome WebDriver instance")
+                driver = webdriver.Chrome(service=Service(chrome_driver_path), options=options)
+                logger.info(f"ChromeDriver session created with ID: {driver.session_id}")
+                
         elif browser_name.lower() == "firefox":
             options = FirefoxOptions()
             logger.info("Initializing Firefox options")
@@ -117,144 +212,120 @@ def driver(browser_name, headless, selenium_host, selenium_port):
             if headless:
                 logger.info("Adding --headless argument to Firefox")
                 options.add_argument("--headless")
+                
+            logger.info(f"Firefox options: {options.arguments}")
+            
+            if use_remote or in_selenium_container:
+                # Set up RemoteWebDriver
+                selenium_url = f"http://{selenium_host}:{selenium_port}/wd/hub"
+                logger.info(f"Connecting to Selenium Grid at: {selenium_url}")
+                
+                driver = webdriver.Remote(
+                    command_executor=selenium_url,
+                    options=options
+                )
+                logger.info(f"RemoteWebDriver session created with ID: {driver.session_id}")
+            else:
+                # Use local GeckoDriver
+                from selenium.webdriver.firefox.service import Service
+                from webdriver_manager.firefox import GeckoDriverManager
+                
+                logger.info("Installing GeckoDriver")
+                gecko_driver_path = GeckoDriverManager().install()
+                logger.info(f"GeckoDriver installed at: {gecko_driver_path}")
+                
+                logger.info("Creating Firefox WebDriver instance")
+                driver = webdriver.Firefox(service=Service(gecko_driver_path), options=options)
+                logger.info(f"GeckoDriver session created with ID: {driver.session_id}")
         else:
             error_msg = f"Unsupported browser: {browser_name}"
             logger.error(error_msg)
             raise ValueError(error_msg)
         
-        # Set up RemoteWebDriver
-        selenium_url = f"http://{selenium_host}:{selenium_port}/wd/hub"
-        logger.info(f"Connecting to Selenium Grid at: {selenium_url}")
-        
-        driver = webdriver.Remote(
-            command_executor=selenium_url,
-            options=options
-        )
-        
-        logger.info("RemoteWebDriver session created successfully")
-        logger.info(f"Session ID: {driver.session_id}")
-        
-        # Wait for browser to be ready
         logger.info("Maximizing browser window")
         driver.maximize_window()
         
         yield driver
         
-        logger.info("Quitting WebDriver session")
+        logger.info(f"Quitting WebDriver session: {driver.session_id}")
         driver.quit()
         logger.info("WebDriver session terminated")
         
     except Exception as e:
         logger.error(f"Error creating WebDriver: {str(e)}")
         logger.error(f"Exception type: {type(e).__name__}")
-        raise
-
-@pytest.hookimpl(tryfirst=True)
-def pytest_exception_interact(call, report):
-    """
-    Hook to capture and log exceptions during test execution.
-    Specifically focused on SessionNotCreatedException.
-    """
-    if call.excinfo is not None:
-        exception = call.excinfo.value
-        if isinstance(exception, SessionNotCreatedException):
+        
+        if isinstance(e, SessionNotCreatedException):
             logger.error("=" * 80)
-            logger.error("SessionNotCreatedException DETECTED IN HOOK")
+            logger.error("SessionNotCreatedException DETECTED")
             logger.error("=" * 80)
-            logger.error(f"Exception message: {str(exception)}")
+            logger.error(f"Exception message: {str(e)}")
             
             # Check for running Chrome processes
             try:
-                import subprocess
-                import psutil
+                logger.error("Running ps -ef to check all processes:")
+                result = subprocess.run(["ps", "-ef"], capture_output=True, text=True)
+                logger.error(result.stdout)
                 
-                logger.error("Checking for running Chrome processes:")
-                chrome_processes = []
-                for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-                    if 'chrome' in proc.info['name'].lower():
-                        chrome_processes.append(proc.info)
-                
-                if chrome_processes:
-                    logger.error(f"Found {len(chrome_processes)} Chrome processes running:")
-                    for proc in chrome_processes[:5]:  # Limit to first 5 to avoid log spam
-                        logger.error(f"  PID: {proc['pid']}, Name: {proc['name']}")
-                else:
-                    logger.error("No Chrome processes found running")
-                    
-                # Check for Chrome user data directories
                 logger.error("Checking for Chrome user data directories:")
-                temp_dir = tempfile.gettempdir()
-                try:
-                    chrome_dirs = [d for d in os.listdir(temp_dir) if 'chrome' in d.lower()]
-                    if chrome_dirs:
-                        logger.error(f"Found Chrome directories in temp: {chrome_dirs[:5]}")
-                    else:
-                        logger.error("No Chrome directories found in temp")
-                except Exception as e:
-                    logger.error(f"Error checking temp directories: {str(e)}")
-                    
-            except ImportError:
-                logger.error("psutil not installed, skipping process check")
-            except Exception as e:
-                logger.error(f"Error checking Chrome processes: {str(e)}")
+                result = subprocess.run(["find", "/tmp", "-name", "*chrome*"], capture_output=True, text=True)
+                logger.error(result.stdout)
                 
-            logger.error("=" * 80)
+                logger.error("Checking Selenium server status:")
+                status_result = subprocess.run(["curl", f"http://{selenium_host}:{selenium_port}/wd/hub/status"], 
+                                            capture_output=True, text=True)
+                logger.error(status_result.stdout)
+            except Exception as check_e:
+                logger.error(f"Error during diagnostic checks: {str(check_e)}")
+                
+        raise
 
-
+@pytest.hookimpl(tryfirst=True)
 def pytest_sessionstart(session):
-    """
-    Hook that runs before the test session starts.
-    Log information about the test environment.
-    """
+    """Log environment information at the start of the test session."""
     logger.info("=" * 80)
     logger.info("TEST SESSION STARTING")
     logger.info("=" * 80)
-    
-    # Log system information
     logger.info(f"OS: {platform.system()} {platform.release()} {platform.version()}")
     logger.info(f"Python: {sys.version}")
-    logger.info(f"pytest: {pytest.__version__}")
-    
-    # Log current working directory and temp directory
     logger.info(f"Current working directory: {os.getcwd()}")
-    logger.info(f"Temp directory: {tempfile.gettempdir()}")
     
-    # Check if Chrome is installed and log its version
+    # Check container-specific information
+    logger.info("Container information:")
     try:
-        import subprocess
-        if platform.system() == 'Linux':
-            chrome_path = subprocess.check_output(['which', 'google-chrome']).decode().strip()
-            chrome_version = subprocess.check_output(['google-chrome', '--version']).decode().strip()
-        elif platform.system() == 'Darwin':  # macOS
-            chrome_path = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
-            if os.path.exists(chrome_path):
-                chrome_version = subprocess.check_output([chrome_path, '--version']).decode().strip()
-            else:
-                chrome_path = 'Not found'
-                chrome_version = 'Not installed'
-        elif platform.system() == 'Windows':
-            import winreg
-            try:
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe")
-                chrome_path = winreg.QueryValue(key, None)
-                chrome_version = subprocess.check_output([chrome_path, '--version']).decode().strip()
-            except:
-                chrome_path = 'Not found in registry'
-                chrome_version = 'Unknown'
+        # Check if running in Docker
+        in_docker = os.path.exists('/.dockerenv')
+        logger.info(f"Running in Docker: {in_docker}")
         
-        logger.info(f"Chrome path: {chrome_path}")
-        logger.info(f"Chrome version: {chrome_version}")
+        # Check hostname
+        hostname = socket.gethostname()
+        logger.info(f"Hostname: {hostname}")
+        
+        # Check important environment variables
+        env_vars = ['HOME', 'USER', 'PATH', 'SELENIUM_BROWSER', 'DISPLAY', 
+                    'CHROME_BIN', 'CHROMEWEBDRIVER', 'SE_OPTS']
+        logger.info("Environment variables:")
+        for var in env_vars:
+            if var in os.environ:
+                logger.info(f"  {var}: {os.environ[var]}")
+                
+        # Check if this is a Selenium container
+        is_selenium_container = os.path.exists('/opt/selenium')
+        logger.info(f"Is Selenium container: {is_selenium_container}")
+        
+        # Check Selenium-specific directories
+        selenium_dirs = ['/opt/selenium', '/opt/bin', '/opt/drivers']
+        for d in selenium_dirs:
+            if os.path.exists(d):
+                logger.info(f"Directory {d} exists")
+                try:
+                    files = os.listdir(d)
+                    logger.info(f"  Contents: {', '.join(files[:5])}{' (more...)' if len(files) > 5 else ''}")
+                except:
+                    logger.info(f"  Could not list contents")
     except Exception as e:
-        logger.info(f"Failed to detect Chrome: {str(e)}")
-    
-    # Log available browsers from webdriver_manager
-    try:
-        logger.info("Available browser drivers:")
-        logger.info(f"  Chrome driver: {ChromeDriverManager().driver_version}")
-        logger.info(f"  Firefox driver: {GeckoDriverManager().driver_version}")
-    except Exception as e:
-        logger.info(f"Failed to get browser driver versions: {str(e)}")
-    
+        logger.info(f"Error checking container info: {str(e)}")
+        
     logger.info("=" * 80)
 
 

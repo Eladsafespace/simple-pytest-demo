@@ -17,6 +17,11 @@ import tempfile
 import platform
 import subprocess
 import logging
+import socket
+import json
+import time
+import requests
+from urllib.parse import urljoin
 
 # Configure logging
 logging.basicConfig(
@@ -27,6 +32,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def run_command(cmd, log_output=True):
+    """Run a command and return the output."""
+    try:
+        logger.info(f"Running command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if log_output:
+            if result.stdout:
+                for line in result.stdout.splitlines():
+                    logger.info(f"  {line}")
+            if result.stderr:
+                for line in result.stderr.splitlines():
+                    logger.error(f"  {line}")
+        return result.stdout, result.stderr
+    except Exception as e:
+        logger.error(f"Error running command {cmd}: {str(e)}")
+        return None, str(e)
+
 def check_chrome_processes():
     """Check for running Chrome processes."""
     logger.info("=" * 80)
@@ -34,29 +56,41 @@ def check_chrome_processes():
     logger.info("=" * 80)
     
     try:
-        import psutil
+        # Check using ps
+        logger.info("Using ps to check for Chrome processes:")
+        run_command(["ps", "-ef"])
         
-        chrome_processes = []
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-            try:
-                if 'chrome' in proc.info['name'].lower():
-                    chrome_processes.append(proc.info)
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                pass
+        logger.info("Filtering for chrome processes:")
+        run_command(["ps", "-ef", "|", "grep", "chrome"])
         
-        if chrome_processes:
-            logger.info(f"Found {len(chrome_processes)} Chrome processes running:")
-            for proc in chrome_processes:
-                logger.info(f"  PID: {proc['pid']}, Name: {proc['name']}")
-                if proc.get('cmdline'):
-                    logger.info(f"  Command: {' '.join(proc['cmdline'])}")
-                logger.info("-" * 40)
-        else:
-            logger.info("No Chrome processes found running")
+        # Check using pgrep
+        logger.info("Using pgrep to check for Chrome processes:")
+        run_command(["pgrep", "-a", "chrome"])
+        
+        # Try with psutil if available
+        try:
+            import psutil
             
-    except ImportError:
-        logger.error("psutil not installed, cannot check processes")
-        logger.error("Install with: pip install psutil")
+            chrome_processes = []
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    if 'chrome' in proc.info['name'].lower():
+                        chrome_processes.append(proc.info)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    pass
+            
+            if chrome_processes:
+                logger.info(f"Found {len(chrome_processes)} Chrome processes using psutil:")
+                for proc in chrome_processes:
+                    logger.info(f"  PID: {proc['pid']}, Name: {proc['name']}")
+                    if proc.get('cmdline'):
+                        logger.info(f"  Command: {' '.join(proc['cmdline'])}")
+                    logger.info("-" * 40)
+            else:
+                logger.info("No Chrome processes found using psutil")
+        except ImportError:
+            logger.warning("psutil not installed, skipping psutil checks")
+            
     except Exception as e:
         logger.error(f"Error checking Chrome processes: {str(e)}")
     
@@ -72,22 +106,26 @@ def check_chrome_user_data_dirs():
     logger.info(f"Temporary directory: {temp_dir}")
     
     try:
-        all_dirs = os.listdir(temp_dir)
-        chrome_dirs = [d for d in all_dirs if 'chrome' in d.lower()]
+        # Check using find
+        logger.info("Using find to search for Chrome directories:")
+        stdout, stderr = run_command(["find", temp_dir, "-name", "*chrome*", "-type", "d"], log_output=False)
         
-        if chrome_dirs:
-            logger.info(f"Found {len(chrome_dirs)} Chrome-related directories in temp:")
+        if stdout:
+            chrome_dirs = stdout.strip().split('\n')
+            logger.info(f"Found {len(chrome_dirs)} Chrome-related directories:")
             for chrome_dir in chrome_dirs:
-                full_path = os.path.join(temp_dir, chrome_dir)
-                if os.path.isdir(full_path):
-                    size = sum(os.path.getsize(os.path.join(dirpath, filename)) 
-                              for dirpath, _, filenames in os.walk(full_path) 
-                              for filename in filenames)
-                    logger.info(f"  {chrome_dir} (Size: {size/1024/1024:.2f} MB)")
+                if os.path.isdir(chrome_dir):
+                    try:
+                        size = sum(os.path.getsize(os.path.join(dirpath, filename)) 
+                                for dirpath, _, filenames in os.walk(chrome_dir) 
+                                for filename in filenames)
+                        logger.info(f"  {chrome_dir} (Size: {size/1024/1024:.2f} MB)")
+                    except:
+                        logger.info(f"  {chrome_dir} (Size: unknown)")
                     
                     # Check if directory is locked
                     try:
-                        test_file = os.path.join(full_path, 'test_lock')
+                        test_file = os.path.join(chrome_dir, 'test_lock')
                         with open(test_file, 'w') as f:
                             f.write('test')
                         os.remove(test_file)
@@ -95,7 +133,12 @@ def check_chrome_user_data_dirs():
                     except Exception as e:
                         logger.info(f"  Directory appears to be LOCKED: {str(e)}")
         else:
-            logger.info("No Chrome-related directories found in temp")
+            logger.info("No Chrome-related directories found using find")
+            
+        # Check using ls
+        logger.info(f"Contents of {temp_dir}:")
+        run_command(["ls", "-la", temp_dir])
+            
     except Exception as e:
         logger.error(f"Error checking Chrome directories: {str(e)}")
     
@@ -112,43 +155,139 @@ def check_system_info():
     logger.info(f"Current working directory: {os.getcwd()}")
     logger.info(f"Temp directory: {tempfile.gettempdir()}")
     
-    # Check if Chrome is installed and log its version
+    # Check if running in Docker
+    in_docker = os.path.exists('/.dockerenv')
+    logger.info(f"Running in Docker: {in_docker}")
+    
+    # Check hostname
+    hostname = socket.gethostname()
+    logger.info(f"Hostname: {hostname}")
+    
+    # Check if this is a Selenium container
+    is_selenium_container = os.path.exists('/opt/selenium') or os.environ.get('HOME') == '/home/seluser'
+    logger.info(f"Is Selenium container: {is_selenium_container}")
+    
+    # Check Chrome installation
     try:
         if platform.system() == 'Linux':
-            chrome_path = subprocess.check_output(['which', 'google-chrome']).decode().strip()
-            chrome_version = subprocess.check_output(['google-chrome', '--version']).decode().strip()
-        elif platform.system() == 'Darwin':  # macOS
-            chrome_path = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
-            if os.path.exists(chrome_path):
-                chrome_version = subprocess.check_output([chrome_path, '--version']).decode().strip()
-            else:
-                chrome_path = 'Not found'
-                chrome_version = 'Not installed'
-        elif platform.system() == 'Windows':
-            import winreg
-            try:
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe")
-                chrome_path = winreg.QueryValue(key, None)
-                chrome_version = subprocess.check_output([chrome_path, '--version']).decode().strip()
-            except:
-                chrome_path = 'Not found in registry'
-                chrome_version = 'Unknown'
+            chrome_locations = [
+                '/usr/bin/google-chrome',
+                '/usr/bin/chrome',
+                '/opt/google/chrome/chrome',
+                '/usr/local/bin/chrome'
+            ]
+            
+            for loc in chrome_locations:
+                if os.path.exists(loc):
+                    logger.info(f"Chrome found at: {loc}")
+                    try:
+                        stdout, stderr = run_command([loc, "--version"], log_output=False)
+                        if stdout:
+                            logger.info(f"Chrome version: {stdout.strip()}")
+                    except:
+                        pass
+            
+            # Check ChromeDriver
+            chromedriver_locations = [
+                '/usr/bin/chromedriver',
+                '/usr/local/bin/chromedriver',
+                '/opt/selenium/chromedriver'
+            ]
+            
+            for loc in chromedriver_locations:
+                if os.path.exists(loc):
+                    logger.info(f"ChromeDriver found at: {loc}")
+                    try:
+                        stdout, stderr = run_command([loc, "--version"], log_output=False)
+                        if stdout:
+                            logger.info(f"ChromeDriver version: {stdout.strip()}")
+                    except:
+                        pass
         
-        logger.info(f"Chrome path: {chrome_path}")
-        logger.info(f"Chrome version: {chrome_version}")
     except Exception as e:
         logger.info(f"Failed to detect Chrome: {str(e)}")
     
-    # Log environment variables that might be relevant
+    # Log environment variables
     logger.info("Environment Variables:")
-    for var in ['HOME', 'TEMP', 'TMP', 'USER', 'PATH']:
-        if var in os.environ:
+    for var in sorted(os.environ.keys()):
+        if var.lower() in ['home', 'user', 'path', 'temp', 'tmp', 'display'] or 'chrome' in var.lower() or 'selenium' in var.lower():
             logger.info(f"  {var}: {os.environ.get(var)}")
     
-    # Log Chrome-specific environment variables
-    chrome_vars = [v for v in os.environ if 'CHROME' in v]
-    for var in chrome_vars:
-        logger.info(f"  {var}: {os.environ.get(var)}")
+    logger.info("=" * 80)
+
+def check_selenium_grid():
+    """Check if Selenium Grid is running."""
+    logger.info("=" * 80)
+    logger.info("CHECKING SELENIUM GRID")
+    logger.info("=" * 80)
+    
+    hosts = ['localhost', '127.0.0.1', '0.0.0.0']
+    ports = ['4444', '5555']
+    
+    for host in hosts:
+        for port in ports:
+            try:
+                url = f"http://{host}:{port}/wd/hub/status"
+                logger.info(f"Checking Selenium Grid at {url}")
+                response = requests.get(url, timeout=2)
+                if response.status_code == 200:
+                    data = response.json()
+                    logger.info(f"Selenium Grid is running at {url}")
+                    logger.info(f"Status: {json.dumps(data, indent=2)}")
+                    
+                    # Check sessions
+                    try:
+                        sessions_url = f"http://{host}:{port}/wd/hub/sessions"
+                        sessions_response = requests.get(sessions_url, timeout=2)
+                        if sessions_response.status_code == 200:
+                            sessions_data = sessions_response.json()
+                            logger.info(f"Active sessions: {json.dumps(sessions_data, indent=2)}")
+                    except:
+                        pass
+                else:
+                    logger.info(f"Selenium Grid returned status code: {response.status_code} at {url}")
+            except requests.exceptions.ConnectionError:
+                logger.info(f"Cannot connect to Selenium Grid at {host}:{port}")
+            except Exception as e:
+                logger.info(f"Error checking Selenium Grid at {host}:{port}: {str(e)}")
+    
+    # Check if selenium-server process is running
+    logger.info("Checking for Selenium server process:")
+    run_command(["ps", "-ef", "|", "grep", "selenium-server"])
+    
+    # Check listening ports
+    logger.info("Checking listening ports:")
+    run_command(["netstat", "-tuln"])
+    
+    logger.info("=" * 80)
+
+def check_file_permissions():
+    """Check file permissions in important directories."""
+    logger.info("=" * 80)
+    logger.info("CHECKING FILE PERMISSIONS")
+    logger.info("=" * 80)
+    
+    directories = [
+        '/tmp',
+        '/dev/shm',
+        '/home/seluser',
+        '/opt/selenium'
+    ]
+    
+    for directory in directories:
+        if os.path.exists(directory):
+            logger.info(f"Checking permissions for {directory}:")
+            run_command(["ls", "-la", directory])
+            
+            # Try to write a test file
+            try:
+                test_file = os.path.join(directory, f'test_file_{int(time.time())}')
+                with open(test_file, 'w') as f:
+                    f.write('test')
+                os.remove(test_file)
+                logger.info(f"Successfully wrote and removed test file in {directory}")
+            except Exception as e:
+                logger.info(f"Failed to write test file in {directory}: {str(e)}")
     
     logger.info("=" * 80)
 
@@ -157,4 +296,6 @@ if __name__ == "__main__":
     check_system_info()
     check_chrome_processes()
     check_chrome_user_data_dirs()
+    check_selenium_grid()
+    check_file_permissions()
     logger.info("Check complete") 
