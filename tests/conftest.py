@@ -1,3 +1,4 @@
+import uuid
 import pytest
 import logging
 import os
@@ -69,55 +70,16 @@ def driver(browser_name, headless):
     logger.info(f"Temp directory: {tempfile.gettempdir()}")
     
     try:
-        if browser_name.lower() == "chrome":
-            options = ChromeOptions()
-            logger.info("Initializing Chrome options")
-            
-            if headless:
-                logger.info("Adding --headless argument")
-                options.add_argument("--headless")
-            
-            logger.info("Adding --no-sandbox argument")
-            options.add_argument("--no-sandbox")
-            
-            logger.info("Adding --disable-dev-shm-usage argument")
-            options.add_argument("--disable-dev-shm-usage")
-            
-            # Log Chrome options
-            logger.info(f"Chrome options: {options.arguments}")
-            
-            # Log ChromeDriver installation
-            logger.info("Installing ChromeDriver")
-            chrome_driver_path = ChromeDriverManager().install()
-            logger.info(f"ChromeDriver installed at: {chrome_driver_path}")
-            
-            # Create Chrome WebDriver
-            logger.info("Creating Chrome WebDriver instance")
-            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-            
-        elif browser_name.lower() == "firefox":
-            options = FirefoxOptions()
-            logger.info("Initializing Firefox options")
-            
-            if headless:
-                logger.info("Adding --headless argument to Firefox")
-                options.add_argument("--headless")
-                
-            # Log Firefox options
-            logger.info(f"Firefox options: {options.arguments}")
-            
-            # Log GeckoDriver installation
-            logger.info("Installing GeckoDriver")
-            gecko_driver_path = GeckoDriverManager().install()
-            logger.info(f"GeckoDriver installed at: {gecko_driver_path}")
-            
-            # Create Firefox WebDriver
-            logger.info("Creating Firefox WebDriver instance")
-            driver = webdriver.Firefox(service=Service(GeckoDriverManager().install()), options=options)
-        else:
-            error_msg = f"Unsupported browser: {browser_name}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+        options = ChromeOptions()
+        unique_profile = f"/tmp/chrome-profile-{uuid.uuid4()}"
+        options.add_argument(f"--user-data-dir={unique_profile}")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+
+        driver = webdriver.Remote(
+            command_executor="http://localhost:4444/wd/hub",
+            options=options
+        )
         
         logger.info("Maximizing browser window")
         driver.maximize_window()
