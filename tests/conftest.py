@@ -178,6 +178,11 @@ def driver(browser_name, headless, selenium_host, selenium_port, use_remote):
             logger.info("Adding --disable-dev-shm-usage argument")
             options.add_argument("--disable-dev-shm-usage")
             
+            # Add user-data-dir for better session management
+            user_data_dir = os.path.join(tempfile.gettempdir(), f"chrome-user-data-{uuid.uuid4()}")
+            logger.info(f"Adding --user-data-dir argument: {user_data_dir}")
+            options.add_argument(f"--user-data-dir={user_data_dir}")
+            
             # Log Chrome options
             logger.info(f"Chrome options: {options.arguments}")
             

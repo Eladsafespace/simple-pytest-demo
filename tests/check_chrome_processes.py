@@ -32,22 +32,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def run_command(cmd, log_output=True):
-    """Run a command and return the output."""
+def run_shell_command(command):
+    """Execute a shell command properly handling pipes."""
     try:
-        logger.info(f"Running command: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if log_output:
-            if result.stdout:
-                for line in result.stdout.splitlines():
-                    logger.info(f"  {line}")
-            if result.stderr:
-                for line in result.stderr.splitlines():
-                    logger.error(f"  {line}")
-        return result.stdout, result.stderr
+        # Use shell=True for commands with pipes
+        if '|' in command:
+            result = subprocess.run(command, shell=True, text=True, capture_output=True)
+        else:
+            # Split command for non-piped commands
+            result = subprocess.run(command.split(), text=True, capture_output=True)
+            
+        if result.returncode != 0 and result.stderr:
+            logging.error(f"  {result.stderr}")
+        return result.stdout
     except Exception as e:
-        logger.error(f"Error running command {cmd}: {str(e)}")
-        return None, str(e)
+        logging.error(f"Error executing command '{command}': {e}")
+        return ""
 
 def check_chrome_processes():
     """Check for running Chrome processes."""
@@ -58,14 +58,14 @@ def check_chrome_processes():
     try:
         # Check using ps
         logger.info("Using ps to check for Chrome processes:")
-        run_command(["ps", "-ef"])
+        run_shell_command("ps -ef")
         
         logger.info("Filtering for chrome processes:")
-        run_command(["ps", "-ef", "|", "grep", "chrome"])
+        run_shell_command("ps -ef | grep chrome")
         
         # Check using pgrep
         logger.info("Using pgrep to check for Chrome processes:")
-        run_command(["pgrep", "-a", "chrome"])
+        run_shell_command("pgrep -a chrome")
         
         # Try with psutil if available
         try:
@@ -108,7 +108,7 @@ def check_chrome_user_data_dirs():
     try:
         # Check using find
         logger.info("Using find to search for Chrome directories:")
-        stdout, stderr = run_command(["find", temp_dir, "-name", "*chrome*", "-type", "d"], log_output=False)
+        stdout = run_shell_command(f"find {temp_dir} -name '*chrome*' -type d -print")
         
         if stdout:
             chrome_dirs = stdout.strip().split('\n')
@@ -137,7 +137,7 @@ def check_chrome_user_data_dirs():
             
         # Check using ls
         logger.info(f"Contents of {temp_dir}:")
-        run_command(["ls", "-la", temp_dir])
+        run_shell_command(f"ls -la {temp_dir}")
             
     except Exception as e:
         logger.error(f"Error checking Chrome directories: {str(e)}")
@@ -181,7 +181,7 @@ def check_system_info():
                 if os.path.exists(loc):
                     logger.info(f"Chrome found at: {loc}")
                     try:
-                        stdout, stderr = run_command([loc, "--version"], log_output=False)
+                        stdout = run_shell_command(f"{loc} --version")
                         if stdout:
                             logger.info(f"Chrome version: {stdout.strip()}")
                     except:
@@ -198,7 +198,7 @@ def check_system_info():
                 if os.path.exists(loc):
                     logger.info(f"ChromeDriver found at: {loc}")
                     try:
-                        stdout, stderr = run_command([loc, "--version"], log_output=False)
+                        stdout = run_shell_command(f"{loc} --version")
                         if stdout:
                             logger.info(f"ChromeDriver version: {stdout.strip()}")
                     except:
@@ -253,11 +253,11 @@ def check_selenium_grid():
     
     # Check if selenium-server process is running
     logger.info("Checking for Selenium server process:")
-    run_command(["ps", "-ef", "|", "grep", "selenium-server"])
+    run_shell_command("ps -ef | grep selenium-server")
     
     # Check listening ports
     logger.info("Checking listening ports:")
-    run_command(["netstat", "-tuln"])
+    run_shell_command("netstat -tuln")
     
     logger.info("=" * 80)
 
@@ -277,7 +277,7 @@ def check_file_permissions():
     for directory in directories:
         if os.path.exists(directory):
             logger.info(f"Checking permissions for {directory}:")
-            run_command(["ls", "-la", directory])
+            run_shell_command(f"ls -la {directory}")
             
             # Try to write a test file
             try:
